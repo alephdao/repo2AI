@@ -1,0 +1,1333 @@
+=== ORIGINAL STATE OF ALL FILES ===
+Commit: 17fd9eed8f0cc673705435c0d1ec33fc3907d3f9
+Description: task 7 added. note this was all done by AI for virgil ereader. I still have to review end to end now
+Date: Fri Jun 13 13:18:30 2025 -0300
+
+==================================================================================
+FILE: src/components/Reader.tsx
+==================================================================================
+import React from "react";
+import type { ReaderProps } from "@/types/reader";
+import { supabase } from "@/integrations/supabase/client";
+import type Section from "epubjs/types/section";
+import type { Book } from "epubjs";
+import Spine from "epubjs/types/spine";
+import UploadPrompt from "./reader/UploadPrompt";
+import ReaderHeader from "./reader/ReaderHeader";
+import MinimalistReaderContent from "./reader/MinimalistReaderContent";
+import { useBookProgress } from "@/hooks/useBookProgress";
+import { useFileHandler } from "@/hooks/useFileHandler";
+import { useNavigation } from "@/hooks/useNavigation";
+import { useBookmarks } from "@/hooks/useBookmarks";
+import { useChapterTitle } from "@/hooks/useChapterTitle";
+import { useRenditionSettings } from "@/hooks/useRenditionSettings";
+import { useHighlights } from "@/hooks/useHighlights";
+import { useSessionTimer } from "@/hooks/useSessionTimer";
+import { useLocationPersistence } from "@/hooks/useLocationPersistence";
+import { useReaderState } from "@/hooks/useReaderState";
+import { ThemeProvider } from "@/contexts/ThemeContext";
+import { useToast } from "@/hooks/use-toast";
+import { useUpdateReadingStatus } from "@/hooks/useUpdateReadingStatus";
+import { VirgilReaderProvider } from "@/contexts/VirgilReaderContext";
+
+interface SpineItem {
+  href: string;
+  index?: number;
+}
+
+interface SearchResult {
+  href: string;
+  excerpt: string;
+  chapterTitle?: string;
+  spineIndex?: number;
+  location?: string;
+  searchText: string;
+}
+
+const Reader: React.FC<ReaderProps> = ({ metadata, preloadedBookUrl, isLoading }) => {
+  const { toast } = useToast();
+  const [showVirgilChat, setShowVirgilChat] = React.useState(false);
+  
+  const {
+    book,
+    setBook,
+    currentLocation,
+    setCurrentLocation,
+    progress,
+    pageInfo,
+    setPageInfo,
+    loadProgress,
+    handleLocationChange,
+  } = useBookProgress();
+
+  const { handleFileUpload: originalHandleFileUpload, loadBookFromUrl } = useFileHandler(
+    setBook,
+    setCurrentLocation,
+    loadProgress,
+    setPageInfo
+  );
+
+  const bookId = React.useMemo(() => {
+    if (metadata && 'id' in metadata) {
+      return metadata.id as string;
+    }
+    return null;
+  }, [metadata]);
+
+  useUpdateReadingStatus(bookId, currentLocation);
+
+  const handleFileUpload = async (file: File) => {
+    try {
+      await originalHandleFileUpload(file);
+      toast({
+        title: "Book loaded successfully",
+        description: `Now reading: ${file.name}`,
+      });
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        description: "Please try again with a valid EPUB file",
+      });
+    }
+  };
+
+  const {
+    fontSize,
+    fontFamily,
+    textAlign,
+    brightness,
+    rendition,
+    handleFontFamilyChange,
+    handleFontSizeChange,
+    handleBrightnessChange,
+    handleRenditionReady,
+    setTextAlign
+  } = useRenditionSettings();
+
+  const { handlePrevPage, handleNextPage } = useNavigation(rendition);
+  const { currentChapterTitle } = useChapterTitle(book, currentLocation, pageInfo);
+  
+  const {
+    showBookmarkDialog,
+    setShowBookmarkDialog,
+    handleBookmarkClick,
+    handleRemoveBookmark
+  } = useBookmarks(book, currentLocation, currentChapterTitle);
+
+  const {
+    highlights,
+    selectedColor,
+    setSelectedColor,
+    addHighlight,
+    removeHighlight,
+  } = useHighlights(book?.key() || null);
+
+  const { isReading, toc, externalLink, handleBookLoad } = useReaderState();
+
+  const findTextInPage = (searchText: string): void => {
+    if (!rendition) return;
+
+    const contents = rendition.getContents();
+    if (!contents || !contents[0]) return;
+
+    const doc = contents[0].document;
+    if (!doc || !doc.body) return;
+
+    const searchTextNode = document.createTextNode(searchText);
+    const normalizedSearchText = searchTextNode.textContent?.toLowerCase() || '';
+
+    const walker = document.createTreeWalker(
+      doc.body,
+      NodeFilter.SHOW_TEXT,
+      null
+    );
+
+    let node: Node | null = walker.nextNode();
+    while (node) {
+      const text = node.textContent?.toLowerCase() || '';
+      const index = text.indexOf(normalizedSearchText);
+      
+      if (index !== -1) {
+        const range = document.createRange();
+        range.setStart(node, index);
+        range.setEnd(node, index + normalizedSearchText.length);
+
+        const selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+
+        const element = node.parentElement;
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          
+          const originalColor = element.style.backgroundColor;
+          element.style.backgroundColor = 'yellow';
+          setTimeout(() => {
+            element.style.backgroundColor = originalColor;
+          }, 2000);
+
+          break;
+        }
+      }
+      node = walker.nextNode();
+    }
+  };
+
+  const handleSearchResultClick = async (result: SearchResult) => {
+    if (!rendition || !book) {
+      console.error('Rendition or book not available');
+      return;
+    }
+
+    try {
+      if (typeof result.spineIndex === 'number') {
+        await rendition.display(result.spineIndex);
+      } else if (result.href) {
+        await rendition.display(result.href);
+      } else {
+        throw new Error('No valid navigation target');
+      }
+
+      rendition.once('rendered', () => {
+        findTextInPage(result.searchText);
+      });
+
+    } catch (error) {
+      console.error('Navigation error:', error);
+      toast({
+        variant: "destructive",
+        description: "Failed to navigate to the search result",
+      });
+    }
+  };
+
+  const handleSearch = async (query: string): Promise<SearchResult[]> => {
+    if (!book || !rendition) return [];
+
+    const results: SearchResult[] = [];
+    
+    try {
+      const spine = book.spine as unknown as { items: SpineItem[] };
+      if (!spine?.items?.length) return [];
+
+      for (const item of spine.items) {
+        try {
+          const content = await book.load(item.href);
+          if (!content || typeof content !== 'object') continue;
+
+          const doc = content as Document;
+          if (!doc.documentElement) continue;
+
+          let chapterTitle = "Unknown Chapter";
+          const headingElement = doc.documentElement.querySelector('h1, h2, h3, h4, h5, h6');
+          if (headingElement) {
+            chapterTitle = headingElement.textContent?.trim() || "Unknown Chapter";
+          }
+
+          const textContent = doc.documentElement.textContent || '';
+          const text = textContent.toLowerCase();
+          const searchQuery = query.toLowerCase();
+          
+          let lastIndex = 0;
+          while (true) {
+            const index = text.indexOf(searchQuery, lastIndex);
+            if (index === -1) break;
+
+            const start = Math.max(0, index - 40);
+            const end = Math.min(text.length, index + query.length + 40);
+            const excerpt = text.slice(start, end);
+
+            results.push({
+              href: item.href,
+              excerpt: `...${excerpt}...`,
+              chapterTitle,
+              spineIndex: item.index,
+              searchText: query
+            });
+            
+            lastIndex = index + 1;
+          }
+        } catch (error) {
+          console.error('Error processing section:', error);
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.error('Error accessing spine items:', error);
+      return [];
+    }
+  };
+
+  React.useEffect(() => {
+    if (preloadedBookUrl && !book) {
+      loadBookFromUrl(preloadedBookUrl).catch(() => {
+        toast({
+          variant: "destructive",
+          description: "Unable to load the book from URL",
+        });
+      });
+    }
+  }, [preloadedBookUrl, loadBookFromUrl, book, toast]);
+
+  React.useEffect(() => {
+    handleBookLoad(book);
+  }, [book]);
+
+  const sessionTime = useSessionTimer(isReading);
+  useLocationPersistence(book, currentLocation);
+
+  const toggleVirgilChat = () => {
+    setShowVirgilChat(!showVirgilChat);
+  };
+
+  return (
+    <VirgilReaderProvider 
+      initialTitle={metadata?.title || "Current Book"}
+      shouldMoveContent={true}
+    >
+      <ThemeProvider>
+        <div className="min-h-screen bg-[#332E38] transition-colors duration-300">
+          <div className="container mx-auto px-0 py-0 max-w-6xl h-screen flex flex-col">
+            {isLoading ? (
+              <div className="flex items-center justify-center min-h-screen">
+                <div className="text-lg text-white">Loading book...</div>
+              </div>
+            ) : !book && !preloadedBookUrl ? (
+              <div>
+                <UploadPrompt onFileUpload={handleFileUpload} />
+              </div>
+            ) : (
+              <MinimalistReaderContent
+                book={book}
+                fontSize={fontSize}
+                fontFamily={fontFamily}
+                textAlign={textAlign}
+                brightness={brightness}
+                currentLocation={currentLocation}
+                progress={progress}
+                pageInfo={pageInfo}
+                sessionTime={sessionTime}
+                highlights={highlights}
+                selectedColor={selectedColor}
+                toc={toc}
+                currentChapterTitle={currentChapterTitle}
+                showBookmarkDialog={showBookmarkDialog}
+                onFontSizeChange={handleFontSizeChange}
+                onFontFamilyChange={handleFontFamilyChange}
+                onTextAlignChange={setTextAlign}
+                onBrightnessChange={handleBrightnessChange}
+                onBookmarkClick={handleBookmarkClick}
+                onLocationChange={handleLocationChange}
+                onPrevPage={handlePrevPage}
+                onNextPage={handleNextPage}
+                onTocNavigate={href => rendition?.display(href)}
+                onRenditionReady={handleRenditionReady}
+                onTextSelect={(cfiRange, text) => addHighlight(cfiRange, text)}
+                setShowBookmarkDialog={setShowBookmarkDialog}
+                handleRemoveBookmark={handleRemoveBookmark}
+                setSelectedColor={setSelectedColor}
+                removeHighlight={removeHighlight}
+                externalLink={metadata?.Cover_super || null}
+                onSearch={handleSearch}
+                onSearchResultClick={handleSearchResultClick}
+                metadata={metadata}
+              />
+            )}
+          </div>
+        </div>
+      </ThemeProvider>
+    </VirgilReaderProvider>
+  );
+};
+
+export { Reader };
+
+
+==================================================================================
+FILE: src/components/reader/VirgilDrawer.tsx
+==================================================================================
+import React from 'react';
+import { useVirgilReader } from '@/contexts/VirgilReaderContext';
+import { useIsMobile } from '@/hooks/use-mobile';
+import VirgilFullScreenChat from '../virgil/VirgilFullScreenChat';
+import SharedVirgilDrawer from '../shared/SharedVirgilDrawer';
+import VirgilFullscreenModal from './VirgilFullscreenModal';
+
+interface VirgilDrawerProps {
+  bookTitle: string;
+}
+
+const VirgilDrawer: React.FC<VirgilDrawerProps> = ({ bookTitle }) => {
+  const { showVirgilChat, toggleVirgilChat } = useVirgilReader();
+  const isMobile = useIsMobile();
+
+  // On mobile, use fullscreen modal
+  if (isMobile) {
+    return (
+      <VirgilFullscreenModal
+        isOpen={showVirgilChat}
+        onClose={toggleVirgilChat}
+        bookTitle={bookTitle}
+      />
+    );
+  }
+
+  // On desktop, use the existing drawer
+  return (
+    <SharedVirgilDrawer
+      isOpen={showVirgilChat}
+      onClose={toggleVirgilChat}
+      theme="reader"
+    >
+      <VirgilFullScreenChat 
+        variant="general"
+        promptId="21" 
+        initialMessage={`I'm Virgil, your intellectual guide. We're currently reading "${bookTitle}". How can I assist you with this text?`}
+        customChatTheme="reader"
+      />
+    </SharedVirgilDrawer>
+  );
+};
+
+export default VirgilDrawer;
+
+
+==================================================================================
+FILE: src/components/virgil/VirgilFullScreenChat.tsx
+==================================================================================
+import React, { useEffect, useRef, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { cn } from '@/lib/utils';
+import { useVirgilChat } from '@/hooks/useVirgilChat';
+import VirgilChatUI from './VirgilChatUI';
+import LoadingSpinner from '@/components/common/LoadingSpinner';
+import { useAuth } from '@/contexts/SupabaseAuthContext';
+import { virgilConfig } from '@/config/virgilConfig';
+import { fetchPromptByPurposeOrId } from '@/utils/promptUtils';
+import { VirgilInstanceType } from '@/types/virgil';
+import { chatThemes, ThemeColors } from './VirgilChatThemes';
+import { ChatVariant } from '@/types/chat';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+
+// Define the structure for the selected model prop expected by useVirgilChat
+interface SelectedModel {
+  id: string;
+  provider: string;
+}
+
+interface VirgilFullScreenChatProps {
+  variant?: 'classroom' | 'exam' | 'general' | 'default' | 'welcome';
+  initialMessage?: string;
+  promptId?: string;
+  examId?: string;
+  courseIdFromParams?: string;
+  userId?: string;
+  systemPrompt?: string;
+  initialMessageOverride?: string;
+  contextIdentifiers?: Record<string, any>;
+  conversationIdToLoad?: string;
+  customChatTheme?: string;
+}
+
+const VirgilFullScreenChat: React.FC<VirgilFullScreenChatProps> = ({
+  variant = 'default',
+  initialMessage,
+  promptId,
+  examId,
+  courseIdFromParams,
+  userId: propUserId,
+  systemPrompt: propSystemPrompt,
+  initialMessageOverride,
+  contextIdentifiers: customContextIdentifiers,
+  conversationIdToLoad,
+  customChatTheme,
+}) => {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const effectiveUserId = propUserId || user?.id;
+  
+  const [internalSystemPrompt, setInternalSystemPrompt] = useState<string>('');
+  const [fetchedInitialMessage, setFetchedInitialMessage] = useState<string | null>(null);
+  const [isLoadingPrompt, setIsLoadingPrompt] = useState(true);
+  const [selectedModel, setSelectedModel] = useState<SelectedModel | null>(null);
+  const [fetchedPromptId, setFetchedPromptId] = useState<string | null>(null);
+
+  // --- ADDED: Helper function to extract provider from model_id ---
+  const extractProviderFromModelId = (modelId: string): string => {
+    if (modelId.includes('/')) {
+      const provider = modelId.split('/')[0];
+      // Normalize provider names
+      switch (provider.toLowerCase()) {
+        case 'anthropic':
+          return 'anthropic';
+        case 'openai':
+          return 'openai';
+        case 'google':
+          return 'google';
+        case 'meta':
+          return 'meta';
+        default:
+          return provider.toLowerCase();
+      }
+    }
+    // Fallback for models without provider prefix
+    if (modelId.includes('claude')) return 'anthropic';
+    if (modelId.includes('gpt')) return 'openai';
+    if (modelId.includes('gemini')) return 'google';
+    return 'anthropic'; // Default fallback
+  };
+
+  const instanceType: VirgilInstanceType = variant === 'classroom' ? 'COURSE_CHAT' 
+                                        : variant === 'exam' ? 'EXAM_CHAT'
+                                        : variant === 'general' ? 'GENERAL_CHAT' 
+                                        : 'GENERAL_CHAT';
+  const config = virgilConfig[instanceType];
+
+  const contextIdentifiers = useMemo(() => {
+    if (customContextIdentifiers) return customContextIdentifiers;
+    const identifiers: Record<string, any> = {};
+    if (courseIdFromParams) identifiers.course_id = courseIdFromParams;
+    else if (examId) identifiers.exam_id = examId;
+    else if (promptId) identifiers.prompt_id = promptId;
+    return identifiers;
+  }, [courseIdFromParams, examId, promptId, customContextIdentifiers]);
+
+  const chatVariantKey: ChatVariant = variant === 'classroom' ? 'classroom' 
+                                    : variant === 'exam' ? 'examroom'
+                                    : variant === 'general' ? 'virgilchat'
+                                    : variant === 'welcome' ? 'welcome'
+                                    : 'default';
+  const themeColors = customChatTheme ? chatThemes[customChatTheme as keyof typeof chatThemes] : chatThemes[chatVariantKey];
+
+  useEffect(() => {
+    if (propSystemPrompt) {
+      setInternalSystemPrompt(propSystemPrompt);
+      setIsLoadingPrompt(false);
+      // Initialize selectedModel even when using propSystemPrompt
+      setSelectedModel({
+        id: 'anthropic/claude-3.5-sonnet-20240620',
+        provider: 'anthropic'
+      });
+      if (initialMessageOverride) {
+        return;
+      }
+    }
+
+    let isMounted = true;
+    setIsLoadingPrompt(true);
+    setFetchedInitialMessage(null);
+    let fetchArgs: Parameters<typeof fetchPromptByPurposeOrId>[0] = {};
+    let fallbackPrompt = "Default Assistant Prompt";
+
+    switch (config.promptSource) {
+      case 'prompt_id':
+        const idToFetch = promptId || examId;
+        if (idToFetch) {
+          if (promptId) fetchArgs = { id: promptId };
+          else if (examId) fetchArgs = { purpose: examId, context: 'exam' };
+        } else {
+          console.warn(`[${instanceType}] promptSource is 'prompt_id' but no promptId or examId provided.`);
+        }
+        break;
+      case 'course_context':
+        if (courseIdFromParams) {
+          fetchArgs = { purpose: 'course_creation', context: 'classroom' };
+        } else {
+          console.warn(`[${instanceType}] promptSource is 'course_context' but no courseIdFromParams provided.`);
+        }
+        break;
+      case 'book_context':
+        console.warn(`[${instanceType}] promptSource 'book_context' not fully implemented.`);
+        break;
+      default:
+        console.error(`[${instanceType}] Unknown promptSource: ${config.promptSource}`);
+    }
+
+    if (Object.keys(fetchArgs).length > 0) {
+      console.log(`[${instanceType}] Fetching prompt with args:`, fetchArgs);
+      fetchPromptByPurposeOrId(fetchArgs)
+        .then((promptData) => {
+          if (isMounted && promptData) {
+            // --- ADDED: Extract and set selectedModel from prompt data ---
+            if (promptData.model_id) {
+              const provider = extractProviderFromModelId(promptData.model_id);
+              console.log(`[${instanceType}] Setting selectedModel from prompt config:`, {
+                id: promptData.model_id,
+                provider: provider
+              });
+              setSelectedModel({
+                id: promptData.model_id,
+                provider: provider
+              });
+            } else {
+              console.log(`[${instanceType}] No model_id in prompt config, using default selectedModel`);
+              setSelectedModel({
+                id: 'anthropic/claude-3-haiku-20240307',
+                provider: 'anthropic'
+              });
+            }
+
+            if (!propSystemPrompt) {
+                let fetchedPrompt = promptData.prompt;
+                console.log(`[${instanceType}] Fetched System Prompt (start):`, fetchedPrompt?.substring(0, 100) + "...");
+                
+                // Enhance system prompt with course-specific context if available
+                if (instanceType === 'COURSE_CHAT' && customContextIdentifiers) {
+                  const courseTitle = customContextIdentifiers.course_title;
+                  const courseDescription = customContextIdentifiers.course_description;
+                  
+                  if (courseTitle && fetchedPrompt) {
+                    console.log(`[${instanceType}] Enhancing system prompt with course title: ${courseTitle}`);
+                    
+                    // Replace placeholder or append course information
+                    if (fetchedPrompt.includes('{{COURSE_TITLE}}')) {
+                      fetchedPrompt = fetchedPrompt.replace(/{{COURSE_TITLE}}/g, courseTitle);
+                    } else {
+                      fetchedPrompt = `${fetchedPrompt}\n\nYou are guiding a course on: "${courseTitle}"`;
+                    }
+                    
+                    // Add course description if available
+                    if (courseDescription) {
+                      console.log(`[${instanceType}] Adding course description to system prompt`);
+                      if (fetchedPrompt.includes('{{COURSE_DESCRIPTION}}')) {
+                        fetchedPrompt = fetchedPrompt.replace(/{{COURSE_DESCRIPTION}}/g, courseDescription);
+                      } else {
+                        fetchedPrompt = `${fetchedPrompt}\n\nCourse description: ${courseDescription}`;
+                      }
+                    }
+                  }
+                }
+                
+                setInternalSystemPrompt(fetchedPrompt || fallbackPrompt);
+            }
+
+            if (!initialMessageOverride && promptData.initial_messages) {
+               const firstKey = Object.keys(promptData.initial_messages)[0];
+               if (firstKey && promptData.initial_messages[firstKey]) {
+                   const fetchedMsg = promptData.initial_messages[firstKey];
+                   console.log(`[${instanceType}] Fetched Initial Message:`, fetchedMsg);
+                   setFetchedInitialMessage(fetchedMsg);
+               } else {
+                   console.log(`[${instanceType}] Fetched prompt has initial_messages field, but no valid message found.`);
+               }
+            } else if (!initialMessageOverride) {
+                console.log(`[${instanceType}] Fetched prompt does not have initial_messages field.`);
+            }
+
+            // Track the fetched prompt ID so we can pass it to useVirgilChat
+            if (promptData.id) {
+              console.log(`[${instanceType}] Setting fetchedPromptId:`, promptData.id);
+              setFetchedPromptId(String(promptData.id));
+            }
+          } else if (isMounted && !propSystemPrompt) {
+             console.warn(`[${instanceType}] Prompt fetch returned no data. Using fallback system prompt.`);
+             setInternalSystemPrompt(fallbackPrompt);
+          }
+        })
+        .catch((err) => {
+          console.error(`Error fetching system prompt for ${instanceType}:`, err);
+          if (isMounted && !propSystemPrompt) {
+            console.log(`[${instanceType}] Using fallback system prompt due to error.`);
+            setInternalSystemPrompt(fallbackPrompt);
+          }
+        })
+        .finally(() => {
+          if (isMounted) setIsLoadingPrompt(false);
+        });
+    } else {
+      console.warn(`[${instanceType}] No valid prompt fetch arguments derived. Using fallback system prompt.`);
+      if (!propSystemPrompt) {
+          setInternalSystemPrompt(fallbackPrompt);
+      }
+      setIsLoadingPrompt(false);
+    }
+
+    return () => { isMounted = false; };
+  }, [propSystemPrompt, config.promptSource, promptId, courseIdFromParams, examId, instanceType, initialMessageOverride]);
+
+  const effectivePromptId = promptId || fetchedPromptId || contextIdentifiers?.prompt_id;
+
+  const finalInitialMessage = initialMessageOverride
+                           || fetchedInitialMessage
+                           || initialMessage;
+
+  const {
+    messages,
+    inputMessage,
+    isRecording,
+    isProcessing,
+    isLoadingHistory,
+    isBlocked: chatIsBlocked,
+    handleInputChange,
+    handleSubmitMessage,
+    toggleRecording,
+    cancelRecording,
+    showLimitDialog,
+    setShowLimitDialog,
+  } = useVirgilChat({
+    userId: effectiveUserId,
+    systemPrompt: internalSystemPrompt || '',
+    storageTable: config.storageTable,
+    contextIdentifiers,
+    selectedModel: selectedModel || { id: 'anthropic/claude-3.5-sonnet-20240620', provider: 'anthropic' },
+    isResumable: config.isResumable,
+    initialMessageOverride: finalInitialMessage,
+    courseId: courseIdFromParams,
+    examId: examId,
+    promptId: effectivePromptId,
+    conversationIdToLoad: conversationIdToLoad,
+  });
+
+  // --- ENHANCED: Loading state displays for complex initialization ---
+  if (isLoadingPrompt || isLoadingHistory || !internalSystemPrompt || !selectedModel) {
+    let message = 'Initializing chat session...';
+    
+    if (isLoadingPrompt) {
+      message = 'Loading configuration and model settings...';
+    } else if (!selectedModel) {
+      message = 'Setting up AI model...';
+    } else if (isLoadingHistory) {
+      message = 'Loading chat history...';
+    } else if (!internalSystemPrompt) {
+      message = 'Preparing system prompt...';
+    }
+    
+    console.log(`[${instanceType}] Loading state:`, {
+      isLoadingPrompt,
+      isLoadingHistory,
+      hasSystemPrompt: !!internalSystemPrompt,
+      hasSelectedModel: !!selectedModel,
+      message
+    });
+    
+    return <LoadingSpinner message={message} />;
+  }
+
+  const handleUpgradeClick = () => {
+    setShowLimitDialog(false);
+    navigate('/membership');
+  };
+
+  return (
+    <div className={cn(
+      "flex-1 flex flex-col h-full w-full overflow-hidden",
+    )}>
+      <VirgilChatUI 
+        messages={messages}
+        inputMessage={inputMessage}
+        isRecording={isRecording}
+        isProcessing={isProcessing}
+        isLoading={isLoadingHistory}
+        isBlocked={chatIsBlocked}
+        handleInputChange={handleInputChange}
+        handleSubmitMessage={handleSubmitMessage}
+        toggleRecording={toggleRecording}
+        cancelRecording={cancelRecording}
+        themeColors={themeColors}
+      />
+
+      <Dialog open={showLimitDialog} onOpenChange={setShowLimitDialog}>
+        <DialogContent className="max-w-[85%] sm:max-w-md bg-[#332E38] text-white border-0">
+          <DialogHeader>
+            <DialogTitle className="text-white mb-2">Usage Limit Reached</DialogTitle>
+            <DialogDescription className="text-white/70">
+              You have used all your available credits for this billing period. 
+              Please upgrade your membership or wait until the next cycle to continue chatting with Virgil.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col space-y-3 py-3 mt-2">
+            <Button 
+              className="w-full h-12 rounded-2xl bg-[#373763] hover:bg-[#4A4A80] text-white text-oxanium uppercase flex items-center justify-center"
+              onClick={handleUpgradeClick}
+            >
+              Upgrade Membership
+            </Button>
+            <Button 
+              className="w-full h-12 rounded-2xl border-none text-black bg-[#E9E7E2] hover:bg-[#D0CCC4] uppercase flex items-center justify-center"
+              onClick={() => setShowLimitDialog(false)}
+            >
+              Close
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+export default VirgilFullScreenChat;
+
+
+==================================================================================
+FILE: src/config/virgilConfig.ts
+==================================================================================
+import { VirgilInstanceType } from '../types/virgil';
+
+// Define the configuration structure for each instance based on PRD V2
+export type VirgilConfig = {
+  storageTable: string; // Name of the Supabase table
+  uiLayout: 'fullscreen' | 'drawer';
+  contextKey: string; // Primary key for context identification (e.g., 'prompt_id', 'book_id', 'course_id', 'exam_id')
+  promptSource: 'prompt_id' | 'book_context' | 'course_context'; // How the prompt is determined based on the contextKey
+  isResumable: boolean; // Can the conversation be resumed?
+  requiresGrading?: boolean; // Does this type need post-conversation grading?
+};
+
+/**
+ * Central configuration for different Virgil chat instances.
+ * Maps each VirgilInstanceType to its specific settings, driving UI layout,
+ * data storage, prompt retrieval, and behavior.
+ */
+export const virgilConfig: Record<VirgilInstanceType, VirgilConfig> = {
+  GENERAL_CHAT: {
+    storageTable: 'virgil_general_conversations',
+    uiLayout: 'fullscreen',
+    contextKey: 'prompt_id', // This ID comes from the selected modality/prompt in the 'prompts' table
+    promptSource: 'prompt_id', // Assumes contextKey value is the prompt_id from 'prompts' table
+    isResumable: true,
+  },
+  READER_CHAT: {
+    storageTable: 'virgil_reader_conversations',
+    uiLayout: 'drawer',
+    contextKey: 'book_id', // Key used by useVirgilChat to identify context
+    promptSource: 'prompt_purpose', // Indicates useVirgilChat should fetch config from public.prompts using purpose 'read_with_virgil'
+    isResumable: true,
+  },
+  COURSE_CHAT: {
+    storageTable: 'virgil_course_conversations',
+    uiLayout: 'fullscreen',
+    contextKey: 'course_id', // The unique identifier for the course
+    promptSource: 'course_context', // Prompt needs to be constructed/fetched based on course context
+    isResumable: true,
+  },
+  EXAM_CHAT: {
+    storageTable: 'virgil_exam_conversations',
+    uiLayout: 'fullscreen',
+    contextKey: 'exam_id', // This ID is used for tagging and maps to a prompt_id in 'prompts' table
+    promptSource: 'prompt_id', // Assumes contextKey value is the prompt_id for the exam prompt
+    isResumable: false,
+    requiresGrading: true,
+  },
+  WELCOME_CHAT: {
+    storageTable: 'virgil_welcome_conversations',
+    uiLayout: 'fullscreen',
+    contextKey: 'prompt_id',
+    promptSource: 'prompt_id',
+    isResumable: true,
+  },
+  // DNA_ASSESSMENT_CHAT is removed as it's not part of the core PRD V2 scope
+  // defined in src/types/virgil.ts VirgilInstanceType
+};
+
+// Helper function to get config (optional)
+export const getVirgilConfig = (instanceType: VirgilInstanceType): VirgilConfig => {
+  const config = virgilConfig[instanceType];
+  if (!config) {
+    throw new Error(`Configuration for Virgil instance type "${instanceType}" not found.`);
+  }
+  return config;
+}; 
+
+
+==================================================================================
+FILE: src/contexts/VirgilReaderContext.tsx
+==================================================================================
+import React, { createContext, useContext, useState, ReactNode, useEffect, useRef } from 'react';
+
+interface VirgilReaderContextType {
+  showVirgilChat: boolean;
+  toggleVirgilChat: () => void;
+  bookTitle: string;
+  shouldMoveContent: boolean;
+}
+
+interface VirgilReaderProviderProps {
+  children: ReactNode;
+  initialTitle?: string;
+  shouldMoveContent?: boolean;
+}
+
+const defaultContext: VirgilReaderContextType = {
+  showVirgilChat: false,
+  toggleVirgilChat: () => {},
+  bookTitle: "Unknown Book",
+  shouldMoveContent: false
+};
+
+export const VirgilReaderContext = createContext<VirgilReaderContextType>(defaultContext);
+
+export const useVirgilReader = () => useContext(VirgilReaderContext);
+
+export const VirgilReaderProvider: React.FC<VirgilReaderProviderProps> = ({ 
+  children, 
+  initialTitle = "Unknown Book",
+  shouldMoveContent = false
+}) => {
+  // Initialize to false; will be updated based on screen size in useEffect
+  const [showVirgilChat, setShowVirgilChat] = useState(false);
+  const [bookTitle, setBookTitle] = useState(initialTitle);
+  // Track if the user has explicitly closed the chat
+  const userClosedChat = useRef(false);
+
+  // Set initial chat visibility based on screen size
+  useEffect(() => {
+    const checkScreenSize = () => {
+      // Only set initial state on first load, not on resize
+      const isDesktop = window.innerWidth >= 768;
+      if (!userClosedChat.current) {
+        setShowVirgilChat(isDesktop);
+      }
+    };
+
+    // Check on mount
+    checkScreenSize();
+
+    // Listen for resize but don't override user preferences
+    const handleResize = () => {
+      const wasDesktop = window.innerWidth >= 768;
+      const isNowDesktop = window.innerWidth >= 768;
+      
+      // Only update if transitioning between mobile/desktop and user hasn't manually closed
+      if (wasDesktop !== isNowDesktop && !userClosedChat.current) {
+        checkScreenSize();
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  const toggleVirgilChat = () => {
+    // When explicitly closing, track that user closed it
+    if (showVirgilChat) {
+      userClosedChat.current = true;
+    } else {
+      userClosedChat.current = false;
+    }
+    setShowVirgilChat(!showVirgilChat);
+  };
+
+  const contextValue = {
+    showVirgilChat,
+    toggleVirgilChat,
+    bookTitle,
+    shouldMoveContent
+  };
+
+  return (
+    <VirgilReaderContext.Provider value={contextValue}>
+      {children}
+    </VirgilReaderContext.Provider>
+  );
+};
+
+
+==================================================================================
+FILE: src/services/ConversationManager.ts
+==================================================================================
+import { SupabaseClient, PostgrestError } from '@supabase/supabase-js';
+// No Database or Json import needed when using <any>
+// import { Database, Json } from '@/types/supabase';
+
+// Base ChatMessage type
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+// Compact conversation summary object structure
+export interface CompactConversationSummary {
+  created_at: string;
+  first_message_id: string;
+  last_message_id: string;
+  llm_summary: string;
+}
+
+// Generic type for conversation metadata - defines the common structure
+// expected by the manager. Specific table types are inferred via Database type.
+interface ConversationBase {
+  id: string;
+  user_id: string;
+  messages: ChatMessage[]; // Ensure this matches the JSONB structure
+  created_at: string;
+  updated_at: string;
+  last_message_preview: string | null;
+  // New field for Virgil 2.0 conversation compaction
+  compact_conversation?: CompactConversationSummary[] | null;
+}
+
+// Example specific conversation type - others would extend ConversationBase
+// interface GeneralChatConversation extends ConversationBase {
+//   prompt_id: string;
+// }
+// interface ReaderConversation extends ConversationBase {
+//   book_id: string;
+// }
+// etc.
+
+export class ConversationManager {
+  // Use <any> to bypass schema type checking
+  private supabase: SupabaseClient<any>;
+
+  constructor(supabaseClient: SupabaseClient<any>) {
+    this.supabase = supabaseClient;
+  }
+
+  private getLastMessagePreview(messages: ChatMessage[]): string | null {
+    if (!messages || messages.length === 0) {
+      return null;
+    }
+    const lastMessage = messages[messages.length - 1];
+    // Truncate preview if necessary (e.g., 100 characters)
+    const preview = lastMessage.content.substring(0, 100);
+    return preview === lastMessage.content ? preview : `${preview}...`;
+  }
+
+  /**
+   * Fetches a single conversation.
+   * Now includes the compact_conversation field which contains an array of 
+   * summary objects for conversation compaction (Virgil 2.0 feature).
+   */
+  async fetchConversation(
+    tableName: string, // Revert to simple string
+    userId: string,
+    contextIdentifiers: Record<string, any>
+  ): Promise<{ data: any | null; error: Error | null }> { // Return type is any
+    // Using select('*') ensures we get all fields including the new compact_conversation field
+    let query = this.supabase
+      .from(tableName)
+      .select('*')
+      .eq('user_id', userId);
+
+    Object.entries(contextIdentifiers).forEach(([key, value]) => {
+      // Map specific context keys to actual DB column names if needed
+      let dbColumn = key;
+      if (tableName === 'virgil_general_conversations' && key === 'prompt_id') {
+        dbColumn = 'mode_id'; // Map incoming 'prompt_id' to 'mode_id' column
+      }
+      // Add other mappings here if necessary for other tables/keys
+      
+      query = query.eq(dbColumn, value);
+    });
+
+    const { data, error } = await query.limit(1).maybeSingle();
+
+    if (error) {
+      console.error(`Error fetching conversation from ${tableName}:`, error);
+      return { data: null, error: new Error(error.message) };
+    }
+    return { data, error: null };
+  }
+
+  /**
+   * Fetches a list of conversation previews.
+   * Note: compact_conversation is NOT included in the default preview fields
+   * as it's only needed for full conversation retrieval, not list views.
+   */
+  async fetchConversationList(
+    tableName: string, // Revert to simple string
+    userId: string,
+    selectFields: string = 'id, updated_at, last_message_preview',
+    limit: number = 50,
+    orderBy: string = 'updated_at',
+    ascending: boolean = false
+  ): Promise<{ data: any[] | null; error: Error | null }> {
+    // Note: selectFields defaults to preview fields without compact_conversation
+    // If compact_conversation is needed for list view, it should be explicitly
+    // requested via selectFields parameter
+    const { data, error } = await this.supabase
+      .from(tableName)
+      .select(selectFields)
+      .eq('user_id', userId)
+      .order(orderBy, { ascending })
+      .limit(limit);
+
+    if (error) {
+      console.error(`Error fetching conversation list from ${tableName}:`, error);
+      return { data: null, error: new Error(error.message) };
+    }
+    return { data, error: null };
+  }
+
+  /**
+   * Creates a new conversation record.
+   * Note: compact_conversation field is not set during creation as it will be
+   * populated by the separate compaction service when needed.
+   */
+  async createConversation(
+    tableName: string, // Revert to simple string
+    userId: string,
+    initialMessages: ChatMessage[],
+    metadata: Record<string, any>
+  ): Promise<{ data: any | null; error: Error | null }> { // Return type is any
+    const now = new Date().toISOString();
+    const last_message_preview = this.getLastMessagePreview(initialMessages);
+
+    // Proactive duplicate checking to prevent race conditions
+    if (tableName === 'virgil_course_conversations' && metadata && metadata.course_id) {
+      console.log(`Checking for existing course conversation before creation: user ${userId}, course ${metadata.course_id}`);
+      const { data: existingData, error: existingError } = await this.supabase
+        .from(tableName)
+        .select('*')
+        .eq('user_id', userId)
+        .eq('course_id', metadata.course_id)
+        .maybeSingle();
+
+      if (existingError && existingError.code !== 'PGRST116') { // Ignore "No rows found" error
+        console.error("Error checking for existing course conversation:", existingError);
+        return { data: null, error: new Error(existingError.message) };
+      }
+
+      if (existingData) {
+        console.log("Found existing course conversation:", existingData.id);
+        return { data: existingData, error: null };
+      }
+    }
+
+    if (tableName === 'virgil_general_conversations' && metadata && metadata.prompt_id) {
+      console.log(`Checking for existing general conversation before creation: user ${userId}, mode ${metadata.prompt_id}`);
+      const { data: existingData, error: existingError } = await this.supabase
+        .from(tableName)
+        .select('*')
+        .eq('user_id', userId)
+        .eq('mode_id', metadata.prompt_id)
+        .maybeSingle();
+
+      if (existingError && existingError.code !== 'PGRST116') { // Ignore "No rows found" error
+        console.error("Error checking for existing general conversation:", existingError);
+        return { data: null, error: new Error(existingError.message) };
+      }
+
+      if (existingData) {
+        console.log("Found existing general conversation:", existingData.id);
+        return { data: existingData, error: null };
+      }
+    }
+
+    // No TableInsert type needed
+    const newConversationData: Record<string, any> = { // Use Record<string, any> for flexibility
+      user_id: userId,
+      messages: initialMessages, // No casting needed
+      created_at: now,
+      updated_at: now,
+      // Spreading metadata can include fields not in the DB table.
+      // ...metadata, 
+    };
+    
+    // Handle table-specific field mapping
+    if (tableName === 'virgil_course_conversations' || tableName === 'virgil_exam_conversations') {
+        // These tables don't have a preview field
+        delete newConversationData.last_message_preview;
+        
+        // Add course_id for virgil_course_conversations
+        if (tableName === 'virgil_course_conversations' && metadata && metadata.course_id) {
+            newConversationData.course_id = metadata.course_id;
+        }
+        
+        // Add exam_id for virgil_exam_conversations
+        if (tableName === 'virgil_exam_conversations' && metadata && metadata.exam_id) {
+            newConversationData.exam_id = metadata.exam_id;
+        }
+    } else if (tableName === 'virgil_general_conversations') {
+        // For general conversations, use last_message field and add mode_id from metadata
+        newConversationData.last_message = this.getLastMessagePreview(initialMessages);
+        // Explicitly add only the known fields from metadata
+        if (metadata && metadata.prompt_id) { 
+            newConversationData.mode_id = metadata.prompt_id; // Map prompt_id from metadata to mode_id column
+        }
+        if (metadata && metadata.mode_title) {
+            newConversationData.mode_title = metadata.mode_title;
+        }
+        if (metadata && metadata.mode_icon) {
+            newConversationData.mode_icon = metadata.mode_icon;
+        }
+        // DO NOT add metadata.mode_subtitle as the column likely doesn't exist
+    } else {
+        // For other tables use standard preview field
+        newConversationData.last_message_preview = this.getLastMessagePreview(initialMessages);
+        // If other tables need specific metadata, handle it here
+        // For now, we won't spread metadata for them either to be safe.
+    }
+
+    const { data, error } = await this.supabase
+      .from(tableName)
+      .insert(newConversationData)
+      .select()
+      .single();
+
+    if (error) {
+      console.error(`Error creating conversation in ${tableName}:`, error);
+      
+      // Handle unique constraint violation (code 23505) for course conversations
+      if (error.code === '23505' && tableName === 'virgil_course_conversations' && 
+          error.message?.includes('virgil_course_conversations_user_id_course_id_key') &&
+          metadata && metadata.course_id) {
+        
+        console.log(`Unique constraint violation - trying to fetch existing conversation for user ${userId} and course ${metadata.course_id}`);
+        
+        // Attempt to fetch the existing conversation
+        const { data: existingData, error: fetchError } = await this.supabase
+          .from(tableName)
+          .select('*')
+          .eq('user_id', userId)
+          .eq('course_id', metadata.course_id)
+          .single();
+          
+        if (fetchError) {
+          console.error(`Error fetching existing conversation:`, fetchError);
+          return { data: null, error: new Error(error.message) };
+        }
+        
+        console.log(`Successfully retrieved existing conversation:`, existingData?.id);
+        return { data: existingData, error: null };
+      }
+      
+      // Handle unique constraint violation for general conversations
+      if (error.code === '23505' && tableName === 'virgil_general_conversations' && 
+          metadata && metadata.prompt_id) {
+        
+        console.log(`Unique constraint violation - trying to fetch existing general conversation for user ${userId} and mode ${metadata.prompt_id}`);
+        
+        // Attempt to fetch the existing conversation
+        const { data: existingData, error: fetchError } = await this.supabase
+          .from(tableName)
+          .select('*')
+          .eq('user_id', userId)
+          .eq('mode_id', metadata.prompt_id)
+          .single();
+          
+        if (fetchError) {
+          console.error(`Error fetching existing general conversation:`, fetchError);
+          return { data: null, error: new Error(error.message) };
+        }
+        
+        console.log(`Successfully retrieved existing general conversation:`, existingData?.id);
+        return { data: existingData, error: null };
+      }
+      
+      return { data: null, error: new Error(error.message) };
+    }
+    return { data, error: null };
+  }
+
+  /**
+   * Updates an existing conversation.
+   * Note: compact_conversation field updates are handled by the separate
+   * compaction service, not through this method. This method handles
+   * updates to messages and other metadata.
+   */
+  async updateConversation(
+    tableName: string, 
+    conversationId: string,
+    updates: { messages?: ChatMessage[] } & Record<string, any> // Make messages optional for updates that don't include it
+  ): Promise<{ data: any | null; error: Error | null }> {
+    
+    const updatePayload: Record<string, any> = {
+      ...updates, // Include all provided updates
+      updated_at: new Date().toISOString(),
+    };
+
+    // Remove the messages field itself from the payload if it exists,
+    // as it's often large and already handled by the DB structure. 
+    // The caller should ensure `messages` is part of the base `updates` if it *needs* to be updated.
+    // Typically, we only update metadata or timestamps here.
+    if ('messages' in updatePayload) {
+        // Optionally calculate preview IF messages are provided AND the column exists
+        // updatePayload.last_message_preview = this.getLastMessagePreview(updatePayload.messages);
+        // delete updatePayload.messages; // Decide if you want to delete messages from payload
+    }
+    // Handle table-specific field mapping for updates
+    if (tableName === 'virgil_general_conversations') {
+      // For general conversations use last_message field
+      if ('messages' in updates && Array.isArray(updates.messages)) {
+        updatePayload.last_message = this.getLastMessagePreview(updates.messages);
+      }
+      delete updatePayload.last_message_preview;
+    } else {
+      // For other tables, remove last_message_preview as needed
+      delete updatePayload.last_message_preview;
+    }
+
+    // Check if progress_percentage is included and ensure it's valid
+    if (tableName === 'virgil_course_conversations' && 'progress_percentage' in updatePayload) {
+        updatePayload.progress_percentage = Math.max(0, Math.min(100, Math.round(updatePayload.progress_percentage ?? 0)));
+    } else if (tableName === 'virgil_course_conversations') {
+         // If updating course convo without progress, remove it from payload to avoid errors
+         // if it happened to be in the 'updates' object mistakenly.
+         delete updatePayload.progress_percentage;
+    }
+
+    // Prevent trying to update messages directly if it was accidentally passed
+    // and not handled above (safer approach)
+    // delete updatePayload.messages; // REMOVE THIS LINE TO ALLOW MESSAGES UPDATE
+
+    // Filter out undefined values to avoid Supabase errors
+    Object.keys(updatePayload).forEach(key => updatePayload[key] === undefined && delete updatePayload[key]);
+
+    const { data, error } = await this.supabase
+      .from(tableName)
+      .update(updatePayload)
+      .eq('id', conversationId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error(`Error updating conversation ${conversationId} in ${tableName}:`, error);
+       return { data: null, error: new Error(error.message) };
+    }
+    return { data, error: null };
+  }
+
+  /**
+   * Deletes a specific conversation.
+   */
+  async deleteConversation(
+    tableName: string, // Revert to simple string
+    conversationId: string,
+    userId: string
+  ): Promise<{ error: Error | null }> {
+    const { error } = await this.supabase
+      .from(tableName)
+      .delete()
+      .eq('id', conversationId);
+
+    if (error) {
+      console.error(`Error deleting conversation ${conversationId} from ${tableName}:`, error);
+      return { error: new Error(error.message) };
+    }
+     return { error: null };
+  }
+}
+
+
+==================================================================================
+FILE: src/types/chat.d.ts
+==================================================================================
+import { ChatMessage } from 'ai';
+
+export type ChatVariant = 'virgilchat' | 'virgildna' | 'default' | 'classroom' | 'examroom' | 'welcome';
+
+export interface ChatMessage {
+  id: string;
+  content: string;
+  role: 'user' | 'assistant' | 'system';
+  audioUrl?: string;
+  isNew?: boolean;
+  transcribedText?: string;
+}
+
+
